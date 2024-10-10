@@ -1,0 +1,16 @@
+{
+    "apps": {
+        "vaulted_apps": {
+            "Agent.exe": {
+                "is_vaulted": true,
+                "is_rented": false,
+                "vault_time": 1728325272.964746,
+                "start_time": null,
+                "end_time": null
+            }
+        }
+    },
+    "credits": {
+        "total_credits": 424
+    }
+}
