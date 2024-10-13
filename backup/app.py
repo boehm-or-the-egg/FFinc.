@@ -508,6 +508,8 @@ class TimerApp(QWidget):
         self.pomodoro_duration.setMinimumWidth(250)
         self.pomodoro_count.setMinimumWidth(150)
 
+
+
         # Time input layout
         time_layout = QHBoxLayout()
         time_layout.addWidget(self.pomodoro_duration)
@@ -1056,8 +1058,8 @@ class AppUI(QWidget):
 
         self.setStyleSheet("""
                     QWidget {
-                        background-color: #2b2b2b;
-                        color: #ffffff;
+                        background-color: #202020;
+                        color: #F1EAE3;
                         font-family: 'Rena';
                         font-size: 14px;
                     }
@@ -1176,8 +1178,8 @@ class AppUI(QWidget):
 
         button_toggle_vault = QPushButton("Toggle Vault")
         button_toggle_vault.clicked.connect(self.toggle_vault_visibility)
-        self.timer_app.setFixedSize(500, 275)  # Set appropriate width and height
-        self.vault_widget.setFixedSize(500, 400)  # Set appropriate width and height
+        self.timer_app.setFixedSize(430, 275)  # Set appropriate width and height
+        self.vault_widget.setFixedSize(430, 400)  # Set appropriate width and height
 
         # Alternatively, you can set size policies
         self.timer_app.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
