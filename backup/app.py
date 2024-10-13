@@ -2,22 +2,23 @@ import os
 import sys
 import threading
 import time
-
 import psutil
-from PyQt6.QtCore import QTimer, Qt, pyqtSlot, pyqtSignal, QObject
+from PyQt6.QtCore import Qt, pyqtSlot, pyqtSignal, QObject, QTimer
 from PyQt6.QtGui import QIcon, QFont, QFontDatabase, QAction
+import pygame
 from PyQt6.QtWidgets import (QMainWindow, QListWidget, QVBoxLayout, QWidget, QLineEdit, QListWidgetItem, QPushButton,
                              QMessageBox, QDialog, QSpinBox, QLabel, QHBoxLayout, QFileDialog, QApplication,
-                             QSystemTrayIcon, QMenu, QSizePolicy, QCheckBox)
+                             QSystemTrayIcon, QMenu, QSizePolicy, QCheckBox, QFrame)
+from pygame.examples.vgrade import timer
 
 from file_manager import FileManager
 
-CREDITS_PER_SECOND = 3
+CREDITS_PER_SECOND = 1
 CREDITS_SAVE_FILE = "../app_data.json"
 CHECK_INTERVAL_RUNNING = 5
 UNVAULT_FEE = 120000
 SIZE_THRESHOLD = 2048 * 1024
-TIMESTEP = 1
+TIMESTEP = 5
 
 
 class SystemAppScanner:
@@ -60,12 +61,11 @@ class SystemAppScanner:
 
         return sorted(running_apps, key=lambda x: x['size'], reverse=True)
 
-
 class AppListWidget(QWidget):
     # noinspection PyUnresolvedReferences
     def __init__(self, scanner, app_manager, vault_window, file_manager):
         super().__init__()
-        self.flow_cred_system = FlowCredSystem(file_manager)
+        self.flow_cred_system = Wallet(file_manager)
         self.scanner = scanner
         self.app_manager = app_manager
         self.vault_window = vault_window
@@ -163,7 +163,7 @@ class AppListWidget(QWidget):
         try:
             selected_items = self.app_list.selectedItems()
             if not selected_items:
-                QMessageBox.warning(self, "Warning", "No application selected to add to vault.")
+                self._show_warning("No application selected to add to vault.")
                 return
 
             for item in selected_items:
@@ -171,14 +171,15 @@ class AppListWidget(QWidget):
                 app_name = os.path.basename(exe_path)
 
                 if not exe_path or not os.path.exists(exe_path):
-                    QMessageBox.warning(self, "Error", f"The application '{app_name}' does not exist.")
+                    self._show_warning(f"The application '{app_name}' does not exist.")
                     continue
 
                 try:
+                    name = str(app_name).removesuffix('.exe')
                     reply = QMessageBox.question(
                         self,
-                        "Vault App",
-                        f"Are you sure you want to vault {app_name}? {app_name} will be permanently blocked unless unvaulted or rented.",
+                        f"Are you sure you want to vault {name}?",
+                        f"{name} will be permanently blocked unless unvaulted or rented.",
                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                         QMessageBox.StandardButton.No
                     )
@@ -189,15 +190,31 @@ class AppListWidget(QWidget):
                     else:
                         return
                 except Exception as e:
-                    QMessageBox.warning(self, "Error Adding App", f"Failed to add {app_name} to the vault: {str(e)}")
+                    self._show_warning(f"Failed to add {app_name} to the vault: {str(e)}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"An error occurred while adding to vault: {str(e)}")
 
     @pyqtSlot(str)
     def on_app_rented(self, message):
         """Handle rental status messages."""
-        QMessageBox.information(self, "Rental Status", message)
+        self._show_message(message, False)
 
+    def _show_message(self, message, is_mute):
+        if not is_mute:
+            AudioCue("notification.wav")
+        self.toast = ToastNotifier(message)
+        self.toast.show()
+        self.toast.raise_()
+        self.toast.activateWindow()
+
+
+
+    def _show_warning(self, message):
+        AudioCue("warning.wav")
+        self.toast = ToastNotifier(message)
+        self.toast.show()
+        self.toast.raise_()
+        self.toast.activateWindow()
 
 class ScanWindow(QMainWindow):
     def __init__(self, vault_window, file_manager):
@@ -206,7 +223,7 @@ class ScanWindow(QMainWindow):
             self.setWindowTitle("System App Scanner")
             self.setGeometry(100, 100, 400, 400)
             self.scanner = SystemAppScanner()
-            self.app_manager = AppManager(file_manager, FlowCredSystem(file_manager))
+            self.app_manager = AppManager(file_manager, Wallet(file_manager))
             self.app_list_widget = AppListWidget(self.scanner, self.app_manager, vault_window, file_manager)
             self.app_list_widget._scan_apps(force_refresh=True)
             self.setCentralWidget(self.app_list_widget)
@@ -223,7 +240,7 @@ class AppManager(QObject):
     app_unvaulted_signal = pyqtSignal(str)
     rental_expired_signal = pyqtSignal(str)
 
-    def __init__(self, file_manager, flow_cred_system: 'FlowCredSystem'):
+    def __init__(self, file_manager, flow_cred_system: 'Wallet'):
         super().__init__()
         self.rental_check_timer = None
         self.monitoring_timer = None
@@ -361,7 +378,7 @@ class AppManager(QObject):
         """Handle what happens when the rental expires."""
 
 
-class FlowCredSystem:
+class Wallet:
     def __init__(self, file_manager):
         self.file_manager = file_manager
         self.total_credits = 0
@@ -407,12 +424,11 @@ class FlowCredSystem:
     @property
     def __str__(self):
         """String representation for easy viewing of the FlowCred system status."""
-        return f"Total FlowCreds Earned: {self.total_credits}"
+        return f"Total Earned: {self.total_credits}"
 
 
-# noinspection PyUnresolvedReferences
 class TimerApp(QWidget):
-
+    configuration_confirmed = pyqtSignal()
     def __init__(self, flow_cred_system, app_manager):
         super().__init__()
 
@@ -447,208 +463,295 @@ class TimerApp(QWidget):
         self.app_manager.app_rented_signal.connect(self.update_after_rent)
 
     def init_ui(self):
+        self.layout = QVBoxLayout()
 
+        # Credits label
         self.credits_label = QLabel(f"Wealth: {self.flow_cred_system.get_total_credits()}")
         self.layout.addWidget(self.credits_label)
-
         self.credits_label.setStyleSheet("font-size: 24px;")
+
+        # Timer label centered
+        self.timer_label = QLabel("00:00:00")
+        self.timer_label.setStyleSheet("font-size: 96px;")
+        self.timer_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
         timer_layout = QHBoxLayout()
-        self.setWindowTitle("Study Timer")
-        self.layout.addWidget(self.timer_label)
-        self.timer_label.setStyleSheet("font-size: 72px;")
+        timer_layout.addStretch()
+        timer_layout.addWidget(self.timer_label)
+        timer_layout.addStretch()
+        timer_layout.setContentsMargins(0, 20, 0, 0)
+        #self.timer_label.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed))
         self.layout.addLayout(timer_layout)
+
+        # Bonus label
+        self.bonus_label = QLabel("(+0%) Bonus: 0")
         self.bonus_label.setStyleSheet("font-size: 18px;")
         self.bonus_label.hide()
         self.layout.addWidget(self.bonus_label)
 
+        # Claim bonus button
+        self.claim_bonus_button = QPushButton("Claim Bonus")
         self.claim_bonus_button.setEnabled(False)
         self.claim_bonus_button.hide()
         self.claim_bonus_button.clicked.connect(self.claim_bonus)
         self.layout.addWidget(self.claim_bonus_button)
 
-        self.pomodoro_duration.setRange(0, 120)
+        # Pomodoro duration and count setup
+        self.pomodoro_duration.lineEdit().setReadOnly(True)
+        self.pomodoro_count.lineEdit().setReadOnly(True)
+        self.pomodoro_duration.setRange(15, 120)
         self.pomodoro_duration.setSingleStep(TIMESTEP)
         self.pomodoro_duration.setPrefix("Pomodoro duration: ")
         self.pomodoro_count.setRange(1, 12)
         self.pomodoro_count.setPrefix("Count: ")
         self.pomodoro_count.setValue(2)
-        self.pomodoro_duration.setMinimumWidth(230)
-        self.pomodoro_count.setMinimumWidth(130)
+        self.pomodoro_duration.setMinimumWidth(250)
+        self.pomodoro_count.setMinimumWidth(150)
+
+        # Time input layout
         time_layout = QHBoxLayout()
         time_layout.addWidget(self.pomodoro_duration)
         time_layout.addWidget(self.pomodoro_count)
-
         self.layout.addLayout(time_layout)
+
         self.hide_time_inputs()
 
+        # Configure button
+        self.configure_button = QPushButton("Configure Session")
         self.configure_button.clicked.connect(self.show_time_inputs)
         self.layout.addWidget(self.configure_button)
 
+        # Button layout for start, pause/resume, and skip break
         button_layout = QHBoxLayout()
         self.start_button.clicked.connect(self.start_cancel_session)
         button_layout.addWidget(self.start_button)
-
+        self.pause_resume_button = QPushButton("Pause")
         self.pause_resume_button.clicked.connect(self.pause_resume_session)
         self.pause_resume_button.setEnabled(False)
         button_layout.addWidget(self.pause_resume_button)
-        self.skip_break.stateChanged.connect(self.is_skip_break)
+        self.skip_break = QCheckBox("Skip Breaks")
         button_layout.addWidget(self.skip_break)
 
         self.layout.addLayout(button_layout)
 
+        # Set the main layout
         self.setLayout(self.layout)
 
+        # Connect timer signal
         self.timer.timeout.connect(self.update_timer)
 
-    def is_skip_break(self,state):
-        return state == Qt.CheckState.Checked
+    def start_session(self):
+        pomodoro_duration = self.pomodoro_duration.value() * 60
+        pomodoro_count = self.pomodoro_count.value()
+        total_duration = pomodoro_duration * pomodoro_count
 
-    def update_credits_display(self):
-        self.credits_label.setText(f"Wealth: {self.flow_cred_system.get_total_credits()}")
+        self._initialize_session_state(pomodoro_duration, total_duration)
 
-    def show_time_inputs(self):
-        self.pomodoro_duration.show()
-        self.pomodoro_count.show()
-        self.configure_button.setText("Confirm")
-        self.configure_button.clicked.connect(self.confirm_configuration)
+        if total_duration > 3600:  # 1 hour
+            self._calculate_bonus(total_duration, pomodoro_count)
+        else:
+            self._reset_bonus()
+        self._setup_ui_for_session()
+        self.timer.start(1000)
+        AudioCue("timer_start.wav")
 
-    def confirm_configuration(self):
-        self.hide_time_inputs()
-        self.configure_button.setText("Configure Session")
-        self.configure_button.clicked.disconnect()
-        self.configure_button.clicked.connect(self.show_time_inputs)
+    def interrupt_session(self):
+        if self._confirm_dialog("Interrupt","Are you sure you want to interrupt the session?"):
+            self.end_session(interrupted=True)
 
-    def hide_time_inputs(self):
-        self.pomodoro_duration.hide()
-        self.pomodoro_count.hide()
+    def end_session(self, interrupted=False):
+        self.timer.stop()
+        self._reset_ui_after_session()
+
+        if interrupted:
+            self._handle_interruption()
+        else:
+            self._handle_completion()
 
     def trigger_auto_break(self):
-        self.in_break = True
-        self.break_time = int(self.pomodoro_duration.value() * 60 * 0.2)
-        self.update_timer_label()
-        self.timer.start(1000)
-        QMessageBox.information(self, "Pomodoro Complete",
-                                "Good Work! I started a break for you, make sure you use it to your advantage.")
+        """Trigger a break if the skip break checkbox is not checked, otherwise skip directly to the next subsession."""
+        if not self.skip_break.isChecked():
+            AudioCue("break.wav")
+            self.in_break = True
+            self.break_time = int(self.pomodoro_duration.value() * 60 * 0.2)
+            self.update_timer_label()
+            self.timer.start(1000)
+            self._show_message("Good Work! I started a break for you.",True)
+        else:
+            self.start_next_subsession()
+
     def end_break(self):
+        self._show_message( "Break over! Starting the next session.",False)
         self.in_break = False
         self.start_next_subsession()
 
     def start_next_subsession(self):
+        """Start the next subsession if available, otherwise end the session."""
         if self.completed_intervals < self.pomodoro_count.value():
             self.remaining_time = self.pomodoro_duration.value() * 60
             self.update_timer_label()
+            self.timer.start(1000)
+
         else:
             self.end_session()
 
-    def start_session(self):
-        session_duration = self.pomodoro_duration.value() * 60
-        total_duration = session_duration * self.pomodoro_count.value()
-
-        if session_duration <= 0:
-            QMessageBox.warning(self, "Invalid Input", "Please select a non-zero time.")
-            return
-
-        self.auto_pause_duration = session_duration * 0.2
+    def _initialize_session_state(self, session_duration, total_duration):
         self.remaining_time = session_duration
         self.global_remaining_time = total_duration
         self.session_completed = False
+        self.auto_pause_duration = session_duration * 0.2
 
+    def _calculate_bonus(self, total_duration, pomodoro_count):
+        self.bonus_multiplier = self.calculate_bonus(total_duration / 3600)
+        self.bonus_credits = (total_duration + (self.auto_pause_duration * (pomodoro_count - 1))) * (
+            self.bonus_multiplier - 1
+        )
+        self.update_bonus_label()
+        self.bonus_label.show()
+
+    def _reset_bonus(self):
+        self.bonus_multiplier = 1.0
+        self.bonus_credits = 0
+
+    def _setup_ui_for_session(self):
         self.claim_bonus_button.setEnabled(False)
         self.configure_button.setEnabled(False)
         self.claim_bonus_button.hide()
         self.bonus_label.hide()
-
-        if total_duration > 3600:
-            self.bonus_multiplier = self.calculate_bonus(total_duration / 3600)
-            self.bonus_credits = (total_duration + (self.auto_pause_duration * (self.pomodoro_count.value() - 1))) * (
-                    self.bonus_multiplier - 1)
-            self.update_bonus_label()
-            self.bonus_label.show()
-        else:
-            self.bonus_multiplier = 1.0
-            self.bonus_credits = 0
-
+        self.skip_break.setEnabled(False)
         self.update_timer_label()
         self.is_running = True
         self.is_paused = False
         self.pause_resume_button.setEnabled(True)
 
-        self.timer.start(1000)
-
-    def update_timer(self):
-        if self.is_running:
-            if self.in_break:
-                self.break_time -= 1
-                self.flow_cred_system.update_credits(CREDITS_PER_SECOND)
-                self.update_credits_display()
-                self.update_timer_label()
-                if self.break_time <= 0:
-                    self.end_break()
-            elif self.remaining_time > 0 and not self.is_paused:
-                self.remaining_time -= 1
-                self.global_remaining_time -= 1
-                self.update_timer_label()
-                self.flow_cred_system.update_credits(CREDITS_PER_SECOND)
-                self.update_credits_display()
-
-                if self.remaining_time <= 0:
-                    self.completed_intervals += 1
-                    if self.completed_intervals < self.pomodoro_count.value():
-                        self.trigger_auto_break()
-                    else:
-                        self.end_session()
-            else:
-                self.end_session()
-
-    def end_session(self, interrupted=False):
-        self.timer.stop()
+    def _reset_ui_after_session(self):
         self.is_running = False
         self.start_button.setText("Start")
         self.pause_resume_button.setEnabled(False)
         self.configure_button.setEnabled(True)
+        self.skip_break.setEnabled(True)
 
-        if interrupted:
-            self.bonus_label.hide()
-            self.claim_bonus_button.hide()
-            QMessageBox.information(self, "Session Interrupted",
-                                    "Your session was interrupted. No bonus will be applied.")
-        else:
-            if self.global_remaining_time <= 0:
-                if self.bonus_credits > 0:
-                    self.claim_bonus_button.setEnabled(True)
-                    self.claim_bonus_button.show()
-
-            QMessageBox.information(self, "Session Complete", "Great job! You completed your study session!")
-
-    def claim_bonus(self):
-
-        self.flow_cred_system.update_credits(self.bonus_credits)
-        self.update_credits_display()
-        self.bonus_credits = 0
+    def _handle_interruption(self):
         self.bonus_label.hide()
         self.claim_bonus_button.hide()
-        QMessageBox.information(self, "Bonus Claimed", "You have claimed your bonus credits!")
+        self._show_warning( "Your session was interrupted. No bonus will be applied.")
 
-    def interrupt_session(self):
-        reply = QMessageBox.question(self, "Interrupt Session",
-                                     "Are you sure you want to interrupt the session?",
-                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                                     QMessageBox.StandardButton.No)
-        if reply == QMessageBox.StandardButton.Yes:
-            self.end_session(interrupted=True)
+    def _handle_completion(self):
+        if self.global_remaining_time <= 0 < self.bonus_credits:
+            self.claim_bonus_button.setEnabled(True)
+            self.claim_bonus_button.show()
+        AudioCue("timer_end.wav")
+        self._show_message("Great job! You completed your study session!",True)
 
-    def update_bonus_label(self):
-        self.bonus_label.setText(f"(+{(self.bonus_multiplier - 1) * 100:.2f}%) Bonus: {int(self.bonus_credits)}")
+    def _show_message(self, message,is_mute):
+        if not is_mute:
+            AudioCue("notification.wav")
+        self.toast = ToastNotifier(message)
+        self.toast.show()
+        self.toast.raise_()
+        self.toast.activateWindow()
+
+
+
+    def _show_warning(self, message):
+        AudioCue("warning.wav")
+        self.toast = ToastNotifier(message)
+        self.toast.show()
+        self.toast.raise_()
+        self.toast.activateWindow()
+
+
+    def _confirm_dialog(self, title, message):
+        reply = QMessageBox.question(
+            self, title, message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        return reply == QMessageBox.StandardButton.Yes
+
+    def update_credits_display(self):
+        """Update the credits label with the current total credits."""
+        self.credits_label.setText(f"Wealth: {self.flow_cred_system.get_total_credits()}")
+
+    def update_timer(self):
+        """Update the timer based on session or break status."""
+        if not self.is_running:
+            return
+
+        if self.in_break:
+            self._handle_break_time()
+        elif not self.is_paused:
+            self._handle_session_time()
+
+    def _handle_break_time(self):
+        """Handle the logic for the break timer."""
+        self.break_time -= 1
+        self._update_credits_and_display()
+
+        if self.break_time <= 0:
+            self.end_break()
+        else:
+            self.update_timer_label()
+
+    def _handle_session_time(self):
+        """Handle the logic for the session timer."""
+        if self.remaining_time > 0:
+            self.remaining_time -= 1
+            self.global_remaining_time -= 1
+            self._update_credits_and_display()
+
+            if self.remaining_time <= 0:
+                self.completed_intervals += 1
+                if self.completed_intervals < self.pomodoro_count.value():
+                    self.trigger_auto_break()
+                else:
+                    self.end_session()
+        else:
+            self.end_session()
+
+    def _update_credits_and_display(self):
+        """Update credits and UI elements during each timer tick."""
+        self.flow_cred_system.update_credits(CREDITS_PER_SECOND)
+        self.update_credits_display()
+        self.update_timer_label()
 
     def update_timer_label(self):
+        """Update the timer label to show the correct time."""
         if self.in_break:
             self.timer_label.setText(f"Break: {self.break_time // 60:02}:{self.break_time % 60:02}")
         else:
-            hours, remainder = divmod(int(self.global_remaining_time), 3600)
+            hours, remainder = divmod(self.global_remaining_time, 3600)
             minutes, seconds = divmod(remainder, 60)
             self.timer_label.setText(f"{hours:02}:{minutes:02}:{seconds:02}")
 
+    # Input Handling
+    def show_time_inputs(self):
+        """Show input fields for configuring session."""
+        self.pomodoro_duration.show()
+        self.pomodoro_count.show()
+        self.configure_button.setText("Confirm")
+        self.configure_button.clicked.connect(self.confirm_configuration)
+        self.configuration_confirmed.emit()
+
+    def confirm_configuration(self):
+        """Hide input fields after confirming session configuration."""
+        self.hide_time_inputs()
+        self.configure_button.setText("Configure Session")
+        self._reconnect_button(self.configure_button, self.show_time_inputs)
+
+
+    def hide_time_inputs(self):
+        """Hide input fields for session configuration."""
+        self.pomodoro_duration.hide()
+        self.pomodoro_count.hide()
+
+    def _reconnect_button(self, button, new_function):
+        """Reconnect button to a new function."""
+        button.clicked.disconnect()
+        button.clicked.connect(new_function)
+
     def start_cancel_session(self):
+        """Start or cancel the session based on the current state."""
         if self.is_running:
             self.is_running = False
             self.start_button.setText("Start")
@@ -658,9 +761,9 @@ class TimerApp(QWidget):
             self.start_button.setText("Cancel")
             self.start_session()
         else:
-            QMessageBox.warning(self, "Error", "Session is not properly configured.")
-
+            self._show_warning("Invalid Configuration!")
     def pause_resume_session(self):
+        """Toggle between pause and resume states."""
         if self.is_paused:
             self.is_paused = False
             self.pause_resume_button.setText("Pause")
@@ -670,26 +773,90 @@ class TimerApp(QWidget):
             self.pause_resume_button.setText("Resume")
             self.timer.stop()
 
-    def update_after_rent(self, message):
-        QMessageBox.information(self, "App Rented", message)
+    # Wealth and Bonus Handling
+    def claim_bonus(self):
+        """Claim the bonus credits and update the display."""
+        self.flow_cred_system.update_credits(self.bonus_credits)
         self.update_credits_display()
+        self.bonus_credits = 0
+        self._hide_bonus_ui()
+        self._show_message("You have claimed your bonus credits!",False)
+
+    def update_bonus_label(self):
+        """Update the bonus label with the current bonus information."""
+        bonus_percentage = (self.bonus_multiplier - 1) * 100
+        self.bonus_label.setText(f"(+{bonus_percentage:.2f}%) Bonus: {int(self.bonus_credits)}")
+
+    def _hide_bonus_ui(self):
+        """Hide the bonus UI elements after claiming the bonus."""
+        self.bonus_label.hide()
+        self.claim_bonus_button.hide()
 
     @staticmethod
     def calculate_bonus(duration):
+        """Calculate bonus multiplier based on the duration."""
         if duration > 1:
             return 1 + (2 * duration ** 2) / (100 + 2 * duration ** 2)
-        else:
-            return 1
+        return 1
 
+    def update_after_rent(self, message):
+        """Update credits after renting the app and display a message."""
+        self._show_message(message,False)
+        self.update_credits_display()
+
+class ToastNotifier(QWidget):
+    def __init__(self, message, duration=5000, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setStyleSheet("background-color: rgba(0, 0, 0, 180); color: white; border-radius: 10px; padding: 10px;")
+        layout = QVBoxLayout()
+        self.label = QLabel(message)
+        self.label.setStyleSheet("font-size: 14px;")
+        layout.addWidget(self.label)
+        self.setLayout(layout)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.close)
+        self.timer.start(duration)
+        self.adjustSize()
+        self.move_to_bottom_right()
+
+    def move_to_bottom_right(self):
+        screen_geometry = QApplication.primaryScreen().geometry()
+        x = screen_geometry.width() - self.width() - 20
+        y = screen_geometry.height() - self.height() - 50
+        self.move(x, y)
+
+class AudioCue:
+    def __init__(self, audio_file):
+        self.toast = None
+        pygame.mixer.init()  # Initialize the mixer
+        self.audio_file = audio_file
+        self.play_audio_in_thread()  # Play sound asynchronously
+
+    def play_audio(self):
+        try:
+            # Load and play the sound
+            sound = pygame.mixer.Sound(self.audio_file)
+            sound.play()
+        except Exception as e:
+            self.toast = ToastNotifier(f"Error playing sound: {e}")
+            self.toast.show()
+            self.toast.raise_()
+            self.toast.activateWindow()
+
+    def play_audio_in_thread(self):
+        # Create a new thread to play sound asynchronously
+        threading.Thread(target=self.play_audio, daemon=True).start()
 
 # noinspection PyUnresolvedReferences
 class RentDialog(QDialog):
-    def __init__(self, credits_per_minute, flow_cred_system, parent=None):
+    def __init__(self, credits_per_minute, wallet, parent=None):
         super().__init__(parent)
         self.credits_per_minute = credits_per_minute
         self.current_price = 0
-        self.flow_cred_system = flow_cred_system
-        self.available_credits = self.flow_cred_system.get_total_credits()
+        self.wallet = wallet
+        self.available_credits = self.wallet.get_total_credits()
 
         layout = QVBoxLayout()
 
@@ -702,10 +869,10 @@ class RentDialog(QDialog):
         self.time_spinner.setValue(5)
         layout.addWidget(self.time_spinner)
 
-        self.price_label = QLabel(f"Price: {self.current_price} FlowCreds")
+        self.price_label = QLabel(f"Price: {self.current_price}")
         layout.addWidget(self.price_label)
 
-        self.balance_label = QLabel(f"Available Credits: {self.available_credits} FlowCreds")
+        self.balance_label = QLabel(f"Available Credits: {self.available_credits}")
         layout.addWidget(self.balance_label)
 
         self.time_spinner.valueChanged.connect(self.update_price_and_balance)
@@ -722,30 +889,29 @@ class RentDialog(QDialog):
         """Update the price label and check if the user has enough credits."""
         time_in_minutes = self.time_spinner.value()
         self.current_price = time_in_minutes * self.credits_per_minute
-        self.price_label.setText(f"Price: {self.current_price} FlowCreds")
+        self.price_label.setText(f"Price: {self.current_price}")
 
-        self.available_credits = self.flow_cred_system.get_total_credits()
-        self.balance_label.setText(f"Available Credits: {self.available_credits} FlowCreds")
+        self.available_credits = self.wallet.get_total_credits()
+        self.balance_label.setText(f"Available Credits: {self.available_credits}")
 
         if self.current_price > self.available_credits:
             self.price_label.setStyleSheet("color: red;")
             self.confirm_button.setEnabled(False)
         else:
-            self.price_label.setStyleSheet("color: default;")
+            self.price_label.setStyleSheet("color: green;")
             self.confirm_button.setEnabled(True)
 
     def get_duration_and_price(self):
         """Return the selected duration and price."""
         return self.time_spinner.value(), self.current_price
 
-
 # noinspection PyUnresolvedReferences
 class VaultWidget(QWidget):
-    def __init__(self, app_manager: 'AppManager', flow_cred_system: 'FlowCredSystem'):
+    def __init__(self, app_manager: 'AppManager', wallet: 'Wallet'):
         super().__init__()
         self.list_widget = None
         self.app_manager = app_manager
-        self.flow_cred_system = flow_cred_system
+        self.wallet = wallet
         self.scan_window = None
         self.setup_ui()
         self.connect_signals()
@@ -753,23 +919,50 @@ class VaultWidget(QWidget):
 
     def setup_ui(self):
         self.setWindowTitle("Vaulted Apps")
+
+        main_layout = QVBoxLayout(self)
+
         self.list_widget = QListWidget(self)
-        layout = QVBoxLayout()
-        layout.addWidget(self.list_widget)
+        main_layout.addWidget(self.list_widget)
 
-        buttons = [
+        hbutton_layout = QHBoxLayout()
+        hbuttons = [
             ("Rent Selected", self.rent_selected_app),
-            ("Unvault Selected", self.unvault_selected_app),
-            ("Manually Add App", self.manual_add_app),
-            ("Add Running App", self.open_scan_window)
+            ("Unvault Selected", self.unvault_selected_app)
         ]
-
-        for label, method in buttons:
+        for label, method in hbuttons:
             button = QPushButton(label, self)
             button.clicked.connect(method)
-            layout.addWidget(button)
+            hbutton_layout.addWidget(button)
 
-        self.setLayout(layout)
+        vbutton_layout = QVBoxLayout()
+        vbuttons = [
+            ("Vault Running App", self.open_scan_window),
+            ("Manually Vault App", self.manual_add_app)
+        ]
+        for label, method in vbuttons:
+            button = QPushButton(label, self)
+            button.clicked.connect(method)
+            vbutton_layout.addWidget(button)
+
+        main_layout.addLayout(hbutton_layout)
+        main_layout.addLayout(vbutton_layout)
+        self.setLayout(main_layout)
+
+    def _show_message(self, message,is_mute):
+        if not is_mute:
+            AudioCue("notification.wav")
+        self.toast = ToastNotifier(message)
+        self.toast.show()
+        self.toast.raise_()
+        self.toast.activateWindow()
+
+    def _show_warning(self, message):
+        AudioCue("warning.wav")
+        self.toast = ToastNotifier(message)
+        self.toast.show()
+        self.toast.raise_()
+        self.toast.activateWindow()
 
     def connect_signals(self):
         signals = [
@@ -780,20 +973,16 @@ class VaultWidget(QWidget):
         for signal, slot in signals:
             signal.connect(slot)
 
-    @pyqtSlot(str)
-    def on_app_vaulted(self):
-        self.refresh_vaulted_apps()
-
     def rent_selected_app(self):
         selected_items = self.list_widget.selectedItems()
         if not selected_items:
-            QMessageBox.warning(self, "Error", "Please select an app to rent.")
+            self._show_warning("Please select an app to rent.")
             return
 
         app_name = selected_items[0].text()
 
         credits_per_minute = 120
-        rent_dialog = RentDialog(credits_per_minute, self.flow_cred_system)
+        rent_dialog = RentDialog(credits_per_minute, self.wallet)
 
         if rent_dialog.exec() == QDialog.DialogCode.Accepted:
             duration_minutes, total_price = rent_dialog.get_duration_and_price()
@@ -803,7 +992,7 @@ class VaultWidget(QWidget):
     def unvault_selected_app(self):
         selected_items = self.list_widget.selectedItems()
         if not selected_items:
-            QMessageBox.warning(self, "Error", "Please select an app to unvault.")
+            self._show_warning("Please select an app to unvault.")
             return
 
         app_name = selected_items[0].text()
@@ -816,10 +1005,11 @@ class VaultWidget(QWidget):
         )
         if file_path and os.path.exists(file_path):
             app_name = os.path.basename(file_path)
+            name = str(app_name).removesuffix('.exe')
             reply = QMessageBox.question(
                 self,
-                "Vault App",
-                f"Are you sure you want to vault {app_name}? {app_name} will be permanently blocked unless unvaulted or rented.",
+                f"Are you sure you want to vault {name}?",
+                f"{name} will be permanently blocked unless unvaulted or rented.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No
             )
@@ -831,12 +1021,18 @@ class VaultWidget(QWidget):
                 return
 
     def open_scan_window(self):
+        # Reset scan_window reference if it was closed
         if self.scan_window is None or not self.scan_window.isVisible():
             file_manager = FileManager()
             self.scan_window = ScanWindow(self, file_manager)
             self.scan_window.show()
+            # Connect the closing signal to reset the reference
+            self.scan_window.destroyed.connect(self.on_scan_window_closed)
         else:
             self.scan_window.activateWindow()
+
+    def on_scan_window_closed(self):
+        self.scan_window = None
 
     def refresh_vaulted_apps(self):
         self.app_manager.load_data()
@@ -844,17 +1040,13 @@ class VaultWidget(QWidget):
         self.list_widget.clear()
 
         for app_name, app_data in self.app_manager.vaulted_apps.items():
-
             item = QListWidgetItem(app_name)
             if app_data['is_rented']:
-                item.setBackground(Qt.GlobalColor.yellow)
-            else:
-                item.setText(app_name)
-
+                item.setBackground(Qt.GlobalColor.gray)
             self.list_widget.addItem(item)
 
     def handle_rental_expiration(self, message):
-        QMessageBox.warning(self, "Rental Expiration", message)
+        self._show_warning(message)
 
 
 # noinspection PyUnresolvedReferences
@@ -862,37 +1054,154 @@ class AppUI(QWidget):
     def __init__(self):
         super().__init__()
 
-        self.initial_size = self.sizeHint()
+        self.setStyleSheet("""
+                    QWidget {
+                        background-color: #2b2b2b;
+                        color: #ffffff;
+                        font-family: 'Rena';
+                        font-size: 14px;
+                    }
+
+                    QPushButton {
+                        background-color: #5a5a5a;
+                        color: #ffffff;
+                        border: 2px solid #3a3a3a;
+                        padding: 5px 15px;
+                        border-radius: 8px;
+                        font-size: 14px;
+                    }
+
+                    QPushButton:hover {
+                        background-color: #6f6f6f;
+                        border: 2px solid #ffffff;
+                    }
+
+                    QPushButton:pressed {
+                        background-color: #8f8f8f;
+                    }
+
+                    QPushButton:disabled {
+                        background-color: #8f8f8f;
+                    }
+
+                    QCheckBox {
+                        spacing: 8px;
+                    }
+                    QCheckBox:disabled {
+                        color: #7a7a7a; /* Muted color for disabled text */
+                    }
+                    QCheckBox::indicator {
+                        width: 16px;
+                        height: 16px;
+                    }
+
+                    QCheckBox::indicator:unchecked {
+                        border: 1px solid #5a5a5a;
+                        background-color: #3a3a3a;
+                    }
+
+                    QCheckBox::indicator:checked {
+                        border: 1px solid #5a5a5a;
+                        background-color: #ffffff;
+                    }
+
+                    QCheckBox::indicator:disabled {
+                        background-color: #4d4d4d;
+                        border: 1px solid #5a5a5a;
+                    }
+
+                    QSpinBox, QDoubleSpinBox {
+                        background-color: #3a3a3a;
+                        color: #ffffff;
+                        border: 1px solid #5a5a5a;
+                        border-radius: 4px;
+                        padding: 2px;
+                        margin: 4px;
+                    }
+
+                    QSpinBox::up-button, QDoubleSpinBox::up-button {
+                        subcontrol-origin: border;
+                        subcontrol-position: top right;
+                        width: 20px;
+                        border-left: 1px solid #5a5a5a;
+                        image: url('up.png');
+                    }
+
+                    QSpinBox::down-button, QDoubleSpinBox::down-button {
+                        subcontrol-origin: border;
+                        subcontrol-position: bottom right;
+                        width: 20px;
+                        border-left: 1px solid #5a5a5a;
+                        image: url('down.png');
+                    
+                    }
+
+                    QSpinBox::up-arrow, QSpinBox::down-arrow, 
+                    QDoubleSpinBox::up-arrow, QDoubleSpinBox::down-arrow {
+                        width: 10px;
+                        height: 10px;
+                        
+                    }
+
+                    QListWidget {
+                        background-color: #3a3a3a;
+                        color: #ffffff;
+                        border: 1px solid #5a5a5a;
+                    }
+
+                    QMenu {
+                        background-color: #3a3a3a;
+                        color: #ffffff;
+                        border: 1px solid #5a5a5a;
+                    }
+
+                    QMenu::item:selected {
+                        background-color: #5a5a5a;
+                    }
+                """)
 
         self.tray_icon = QSystemTrayIcon(self)
         self.setWindowTitle("Flow Factory Incorporated")
-        self.setWindowIcon(QIcon("joe.png"))
+        self.setWindowIcon(QIcon("FFInc Icon.png"))
         self.setWindowFlags(
             Qt.WindowType.Window | Qt.WindowType.WindowMinimizeButtonHint | Qt.WindowType.WindowCloseButtonHint)
-
         self.file_manager = FileManager()
-        self.flow_cred_system = FlowCredSystem(self.file_manager)
-        self.app_manager = AppManager(self.file_manager, self.flow_cred_system)
+        self.wallet = Wallet(self.file_manager)
+        self.app_manager = AppManager(self.file_manager, self.wallet)
 
-        self.timer_app = TimerApp(self.flow_cred_system, self.app_manager)
-        self.vault_widget = VaultWidget(self.app_manager, self.flow_cred_system)
+        self.timer_app = TimerApp(self.wallet, self.app_manager)
+        self.timer_app.configuration_confirmed.connect(self.adjust_size)
+        self.vault_widget = VaultWidget(self.app_manager, self.wallet)
         self.vault_widget.setVisible(False)
-
-        self.vault_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.timer_app.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         button_toggle_vault = QPushButton("Toggle Vault")
         button_toggle_vault.clicked.connect(self.toggle_vault_visibility)
+        self.timer_app.setFixedSize(500, 275)  # Set appropriate width and height
+        self.vault_widget.setFixedSize(500, 400)  # Set appropriate width and height
 
+        # Alternatively, you can set size policies
+        self.timer_app.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.vault_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        line_separator = QFrame()
+        line_separator.setFrameShape(QFrame.Shape.HLine)  # Horizontal line
+        line_separator.setFrameShadow(QFrame.Shadow.Sunken)
+        line_separator.setLineWidth(5)# Optional: make it look sunken
+
+        # Now add the separator to the layout between the timer_app and button_toggle_vault
         main_layout = QVBoxLayout()
         main_layout.addWidget(self.timer_app)
+        main_layout.addWidget(line_separator)  # Add the line here
         main_layout.addWidget(button_toggle_vault)
         main_layout.addWidget(self.vault_widget)
-
+        main_layout.setContentsMargins(20, 20, 20, 20)
         self.setLayout(main_layout)
 
+        self.setLayout(main_layout)
         self.init_tray_icon()
-
+    def adjust_size(self):
+        self.layout().invalidate()
+        self.adjustSize()
     def toggle_vault_visibility(self):
         """Toggle the visibility of the vault widget and adjust window size."""
         if self.vault_widget.isVisible():
@@ -900,8 +1209,7 @@ class AppUI(QWidget):
         else:
             self.vault_widget.setVisible(True)
 
-        self.adjustSize()
-        self.updateGeometry()
+        self.adjust_size()
 
     def revert_to_initial_size(self):
         """Revert the window to its initialized size."""
@@ -909,7 +1217,7 @@ class AppUI(QWidget):
 
     def init_tray_icon(self):
         """Initialize the system tray icon and its menu."""
-        self.tray_icon.setIcon(QIcon("joe.png"))
+        self.tray_icon.setIcon(QIcon("FFInc Icon.png"))
 
         tray_menu = QMenu()
 
@@ -944,12 +1252,17 @@ class AppUI(QWidget):
         else:
             event.ignore()
             self.hide()
-            self.tray_icon.showMessage(
-                "App Running",
-                "The app is minimized to the system tray. Click the icon to restore.",
-                QSystemTrayIcon.MessageIcon.NoIcon,
-                2000
-            )
 
-
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    # NOTE : subject to change / removal
+    font_id = QFontDatabase.addApplicationFont("Rena-Regular.ttf")
+    if font_id != -1:
+        font_families = QFontDatabase.applicationFontFamilies(font_id)
+        if font_families:
+            font = QFont(font_families[0], 12)
+            app.setFont(font)
+    window = AppUI()
+    window.show()
+    sys.exit(app.exec())
 
