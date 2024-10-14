@@ -1,24 +1,93 @@
-import os
-import sys
-import threading
-import time
-import psutil
+import os, sys, json, shutil, threading, time, psutil
+from typing import Any, Dict
+from pygame import mixer
+from pygame.examples.vgrade import timer
+import logging
 from PyQt6.QtCore import Qt, pyqtSlot, pyqtSignal, QObject, QTimer
-from PyQt6.QtGui import QIcon, QFont, QFontDatabase, QAction
-import pygame
+from PyQt6.QtGui import QIcon, QFont, QFontDatabase, QAction, QColor
 from PyQt6.QtWidgets import (QMainWindow, QListWidget, QVBoxLayout, QWidget, QLineEdit, QListWidgetItem, QPushButton,
                              QMessageBox, QDialog, QSpinBox, QLabel, QHBoxLayout, QFileDialog, QApplication,
-                             QSystemTrayIcon, QMenu, QSizePolicy, QCheckBox, QFrame)
-from pygame.examples.vgrade import timer
+                             QSystemTrayIcon, QMenu, QSizePolicy, QCheckBox, QFrame, QGraphicsBlurEffect,QGraphicsDropShadowEffect)
 
-from file_manager import FileManager
+# Constants
 
 CREDITS_PER_SECOND = 1
-CREDITS_SAVE_FILE = "../app_data.json"
 CHECK_INTERVAL_RUNNING = 5
 UNVAULT_FEE = 120000
 SIZE_THRESHOLD = 2048 * 1024
 TIMESTEP = 5
+
+# Core Logic
+
+class FileManager:
+    _instance = None
+    _lock = threading.Lock()
+    DEFAULT_DATA_FILE = 'app_data.json'
+    DEFAULT_STRUCTURE = {
+        'apps': {
+            'vaulted_apps': {},
+        },
+        'credits': {
+            'total_credits': 0
+        }
+    }
+
+    def __new__(cls, *args, **kwargs):
+        """Singleton pattern to ensure only one instance is created."""
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self, data_file: str = DEFAULT_DATA_FILE):
+        if self._initialized:
+            return
+
+        self.data_file = data_file
+        self.temp_file = f"{data_file}.tmp"
+        self.lock = threading.Lock()
+
+        self._initialized = True
+
+    @staticmethod
+    def _validate_json_data(data: Dict[str, Any]) -> Dict[str, Any]:
+        """Ensures the required keys are present and initializes any missing ones."""
+        def recursive_update(d: Dict[str, Any], u: Dict[str, Any]) -> Dict[str, Any]:
+            for k, v in u.items():
+                if isinstance(v, dict):
+                    d[k] = recursive_update(d.get(k, {}), v)
+                else:
+                    d.setdefault(k, v)
+            return d
+
+        return recursive_update(data, FileManager.DEFAULT_STRUCTURE)
+
+    def load_data(self) -> Dict[str, Any]:
+        """Thread-safe load method."""
+        with self.lock:
+            if os.path.exists(self.data_file):
+                try:
+                    with open(self.data_file, 'r', encoding='utf-8') as file:
+                        data = json.load(file)
+                        return self._validate_json_data(data)
+                except (json.JSONDecodeError, IOError) as e:
+                    print(f"Error loading data: {e}")
+                    return self._validate_json_data({})
+            else:
+                return self._validate_json_data({})
+
+    def save_data(self, data: Dict[str, Any]) -> None:
+        """Thread-safe, atomic save method."""
+        with self.lock:
+            data = self._validate_json_data(data)
+
+            try:
+                with open(self.temp_file, 'w', encoding='utf-8') as temp_file:
+                    json.dump(data, temp_file, indent=4)
+                shutil.move(self.temp_file, self.data_file)
+            except IOError as e:
+                print(f"Error saving data: {e}")
 
 
 class SystemAppScanner:
@@ -61,6 +130,7 @@ class SystemAppScanner:
 
         return sorted(running_apps, key=lambda x: x['size'], reverse=True)
 
+
 class AppListWidget(QWidget):
     # noinspection PyUnresolvedReferences
     def __init__(self, scanner, app_manager, vault_window, file_manager):
@@ -78,7 +148,7 @@ class AppListWidget(QWidget):
 
         self.app_list = QListWidget(self)
         self.layout.addWidget(self.app_list)
-
+        self.app_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.add_to_vault_button = QPushButton("Add to Vault", self)
         # noinspection PyUnresolvedReferences
         self.add_to_vault_button.clicked.connect(self.add_to_vault)
@@ -94,6 +164,8 @@ class AppListWidget(QWidget):
         self.filtered_apps = []
 
         self.search_bar.textChanged.connect(self.filter_apps)
+
+
         self.app_manager.app_rented_signal.connect(self.on_app_rented)
 
         self.is_scanning = False
@@ -106,23 +178,31 @@ class AppListWidget(QWidget):
     def update_app_list(self, force_refresh=False):
         """Update the list of running applications."""
         if self.is_scanning:
+            logging.warning("Scan is already in progress.")
             return
         self.is_scanning = True
         threading.Thread(target=self._scan_apps, daemon=True, args=(force_refresh,)).start()
 
+
+    logging.basicConfig(level=logging.DEBUG)
     def _scan_apps(self, force_refresh):
+
         """Thread target to scan apps and progressively update the UI."""
+        logging.debug("Starting app scan...")
         try:
             running_apps = self.scanner.scan_running_apps(force_refresh=force_refresh)
+            logging.debug("Running apps found: %s", running_apps)
 
             self.running_apps = running_apps
             self.filtered_apps = self.filter_applications(self.running_apps)
             QTimer.singleShot(0, self.update_app_list_ui)
 
         except Exception as e:
+            logging.error("Failed to scan applications: %s", str(e))
             QMessageBox.critical(self, "Error", f"Failed to scan applications: {str(e)}")
         finally:
             self.is_scanning = False
+            logging.debug("App scan finished.")
 
     def update_app_list_ui(self):
         """Update the UI with the new app list."""
@@ -207,8 +287,6 @@ class AppListWidget(QWidget):
         self.toast.raise_()
         self.toast.activateWindow()
 
-
-
     def _show_warning(self, message):
         AudioCue("warning.wav")
         self.toast = ToastNotifier(message)
@@ -216,10 +294,12 @@ class AppListWidget(QWidget):
         self.toast.raise_()
         self.toast.activateWindow()
 
+
 class ScanWindow(QMainWindow):
     def __init__(self, vault_window, file_manager):
         super().__init__()
         try:
+            self.setStyleSheet(style_sheet)
             self.setWindowTitle("System App Scanner")
             self.setGeometry(100, 100, 400, 400)
             self.scanner = SystemAppScanner()
@@ -232,7 +312,6 @@ class ScanWindow(QMainWindow):
             self.close()
 
 
-# noinspection PyUnresolvedReferences
 class AppManager(QObject):
     DATA_FILE = '../app_data.json'
     app_rented_signal = pyqtSignal(str)
@@ -281,12 +360,14 @@ class AppManager(QObject):
             'end_time': None
         }
         self.save_data()
+        self.on_app_vaulted(app_name)
 
     def unvault_app(self, app_name):
         with self.lock:
             if app_name in self.vaulted_apps:
                 del self.vaulted_apps[app_name]
                 self.save_data()
+                self.on_on_app_unvaulted(app_name)
             else:
                 return
 
@@ -295,7 +376,7 @@ class AppManager(QObject):
         with self.lock:
 
             if app_name in self.vaulted_apps and self.vaulted_apps[app_name]['is_rented']:
-                self.app_rented_signal.emit(f"{app_name} is already rented.")
+                self.app_rented_signal.emit(f"{app_name.removesuffix(".exe")} is already rented.")
                 return
 
             rental_cost = duration_minutes * 120
@@ -304,7 +385,7 @@ class AppManager(QObject):
                 return
 
             if app_name not in self.vaulted_apps:
-                self.app_rented_signal.emit(f"{app_name} is not vaulted and cannot be rented.")
+                self.app_rented_signal.emit(f"{app_name.removesuffix(".exe")} is not vaulted and cannot be rented.")
                 return
 
             self.vaulted_apps[app_name]['is_rented'] = True
@@ -317,7 +398,7 @@ class AppManager(QObject):
 
             self.flow_cred_system.deduct_credits(rental_cost)
 
-            self.app_rented_signal.emit(f"Rented {app_name} for {duration_minutes} minutes.")
+            self.app_rented_signal.emit(f"Rented {app_name.removesuffix(".exe")} for {duration_minutes} minutes.")
 
             self.save_data()
 
@@ -346,9 +427,24 @@ class AppManager(QObject):
             self.on_app_killed(app_name)
         else:
             return
+    def _show_message(self, message, is_mute):
+        if not is_mute:
+            AudioCue("notification.wav")
+        self.toast = ToastNotifier(message)
+        self.toast.show()
+        self.toast.raise_()
+        self.toast.activateWindow()
+
+    def _show_warning(self, message):
+        AudioCue("warning.wav")
+        self.toast = ToastNotifier(message)
+        self.toast.show()
+        self.toast.raise_()
+        self.toast.activateWindow()
 
     @pyqtSlot(str)
     def on_app_killed(self, app_name):
+        self._show_message(f"Killed {app_name.removesuffix(".exe")}!", False)
         return
 
     def start_rental_check(self):
@@ -375,7 +471,13 @@ class AppManager(QObject):
 
     @pyqtSlot(str)
     def on_rental_expired(self, app_name):
-        """Handle what happens when the rental expires."""
+        self._show_warning(f"Rental for {app_name.removesuffix(".exe")} has expired.")
+
+    def on_app_vaulted(self, app_name):
+        self._show_message(f"Vaulted {app_name.removesuffix(".exe")}!", False)
+
+    def on_on_app_unvaulted(self, app_name):
+        self._show_message(f"Unvaulted {app_name.removesuffix(".exe")}!", False)
 
 
 class Wallet:
@@ -429,6 +531,7 @@ class Wallet:
 
 class TimerApp(QWidget):
     configuration_confirmed = pyqtSignal()
+
     def __init__(self, flow_cred_system, app_manager):
         super().__init__()
 
@@ -472,15 +575,15 @@ class TimerApp(QWidget):
 
         # Timer label centered
         self.timer_label = QLabel("00:00:00")
-        self.timer_label.setStyleSheet("font-size: 96px;")
+        self.timer_label.setStyleSheet("font-size: 82px; font-weight:bold ;font-family: 'Feature Mono';")
         self.timer_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.timer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         timer_layout = QHBoxLayout()
         timer_layout.addStretch()
         timer_layout.addWidget(self.timer_label)
         timer_layout.addStretch()
         timer_layout.setContentsMargins(0, 20, 0, 0)
-        #self.timer_label.setSizePolicy(QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed))
         self.layout.addLayout(timer_layout)
 
         # Bonus label
@@ -507,8 +610,6 @@ class TimerApp(QWidget):
         self.pomodoro_count.setValue(2)
         self.pomodoro_duration.setMinimumWidth(250)
         self.pomodoro_count.setMinimumWidth(150)
-
-
 
         # Time input layout
         time_layout = QHBoxLayout()
@@ -558,7 +659,7 @@ class TimerApp(QWidget):
         AudioCue("timer_start.wav")
 
     def interrupt_session(self):
-        if self._confirm_dialog("Interrupt","Are you sure you want to interrupt the session?"):
+        if self._confirm_dialog("Interrupt", "Are you sure you want to interrupt the session?"):
             self.end_session(interrupted=True)
 
     def end_session(self, interrupted=False):
@@ -578,12 +679,12 @@ class TimerApp(QWidget):
             self.break_time = int(self.pomodoro_duration.value() * 60 * 0.2)
             self.update_timer_label()
             self.timer.start(1000)
-            self._show_message("Good Work! I started a break for you.",True)
+            self._show_message("Good Work! I started a break for you.", True)
         else:
             self.start_next_subsession()
 
     def end_break(self):
-        self._show_message( "Break over! Starting the next session.",False)
+        self._show_message("Break over! Starting the next session.", False)
         self.in_break = False
         self.start_next_subsession()
 
@@ -606,7 +707,7 @@ class TimerApp(QWidget):
     def _calculate_bonus(self, total_duration, pomodoro_count):
         self.bonus_multiplier = self.calculate_bonus(total_duration / 3600)
         self.bonus_credits = (total_duration + (self.auto_pause_duration * (pomodoro_count - 1))) * (
-            self.bonus_multiplier - 1
+                self.bonus_multiplier - 1
         )
         self.update_bonus_label()
         self.bonus_label.show()
@@ -636,16 +737,16 @@ class TimerApp(QWidget):
     def _handle_interruption(self):
         self.bonus_label.hide()
         self.claim_bonus_button.hide()
-        self._show_warning( "Your session was interrupted. No bonus will be applied.")
+        self._show_warning("Your session was interrupted. No bonus will be applied.")
 
     def _handle_completion(self):
         if self.global_remaining_time <= 0 < self.bonus_credits:
             self.claim_bonus_button.setEnabled(True)
             self.claim_bonus_button.show()
         AudioCue("timer_end.wav")
-        self._show_message("Great job! You completed your study session!",True)
+        self._show_message("Great job! You completed your study session!", True)
 
-    def _show_message(self, message,is_mute):
+    def _show_message(self, message, is_mute):
         if not is_mute:
             AudioCue("notification.wav")
         self.toast = ToastNotifier(message)
@@ -653,15 +754,12 @@ class TimerApp(QWidget):
         self.toast.raise_()
         self.toast.activateWindow()
 
-
-
     def _show_warning(self, message):
         AudioCue("warning.wav")
         self.toast = ToastNotifier(message)
         self.toast.show()
         self.toast.raise_()
         self.toast.activateWindow()
-
 
     def _confirm_dialog(self, title, message):
         reply = QMessageBox.question(
@@ -741,13 +839,13 @@ class TimerApp(QWidget):
         self.configure_button.setText("Configure Session")
         self._reconnect_button(self.configure_button, self.show_time_inputs)
 
-
     def hide_time_inputs(self):
         """Hide input fields for session configuration."""
         self.pomodoro_duration.hide()
         self.pomodoro_count.hide()
 
-    def _reconnect_button(self, button, new_function):
+    @staticmethod
+    def _reconnect_button(button, new_function):
         """Reconnect button to a new function."""
         button.clicked.disconnect()
         button.clicked.connect(new_function)
@@ -764,6 +862,7 @@ class TimerApp(QWidget):
             self.start_session()
         else:
             self._show_warning("Invalid Configuration!")
+
     def pause_resume_session(self):
         """Toggle between pause and resume states."""
         if self.is_paused:
@@ -782,7 +881,7 @@ class TimerApp(QWidget):
         self.update_credits_display()
         self.bonus_credits = 0
         self._hide_bonus_ui()
-        self._show_message("You have claimed your bonus credits!",False)
+        self._show_message("You have claimed your bonus credits!", False)
 
     def update_bonus_label(self):
         """Update the bonus label with the current bonus information."""
@@ -803,43 +902,69 @@ class TimerApp(QWidget):
 
     def update_after_rent(self, message):
         """Update credits after renting the app and display a message."""
-        self._show_message(message,False)
+        self._show_message(message, False)
         self.update_credits_display()
+
 
 class ToastNotifier(QWidget):
     def __init__(self, message, duration=5000, parent=None):
         super().__init__(parent)
+
+        # Set up window properties for transparency and frameless window
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setStyleSheet("background-color: rgba(0, 0, 0, 180); color: white; border-radius: 10px; padding: 10px;")
+
+        # Frosted glass effect using transparent background and overlay gradient
+        self.setStyleSheet("""
+            background-color: rgba(0, 0, 0, 0.3); /* Light semi-transparent background */
+            border-radius: 15px;
+            padding: 15px;
+            backdrop-filter: blur(10px); /* Simulate blur (not natively supported but for styling purpose) */
+            box-shadow: 0px 8px 24px rgba(0, 0, 0, 0.2); /* Shadow for floating effect */
+        """)
+
+        # Create the layout for the message text
         layout = QVBoxLayout()
         self.label = QLabel(message)
-        self.label.setStyleSheet("font-size: 14px;")
+
+        # Apply the text style with a soft shadow for readability
+        self.label.setStyleSheet("""
+            color: white;
+            font-size: 14px;
+            text-align: center;
+            text-shadow: 0px 1px 5px rgba(0, 0, 0, 0.8); /* Soft text shadow for better readability */
+        """)
         layout.addWidget(self.label)
         self.setLayout(layout)
+
+        # Timer to auto-close the notification after the given duration
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.close)
         self.timer.start(duration)
+
+        # Adjust the size and position of the toast notification
         self.adjustSize()
         self.move_to_bottom_right()
 
     def move_to_bottom_right(self):
+        """Position the toast in the bottom-right corner of the primary screen."""
         screen_geometry = QApplication.primaryScreen().geometry()
         x = screen_geometry.width() - self.width() - 20
         y = screen_geometry.height() - self.height() - 50
         self.move(x, y)
 
+
 class AudioCue:
     def __init__(self, audio_file):
         self.toast = None
-        pygame.mixer.init()  # Initialize the mixer
+        mixer.init()  # Initialize the mixer
         self.audio_file = audio_file
         self.play_audio_in_thread()  # Play sound asynchronously
 
     def play_audio(self):
         try:
             # Load and play the sound
-            sound = pygame.mixer.Sound(self.audio_file)
+            sound = mixer.Sound(self.audio_file)
             sound.play()
         except Exception as e:
             self.toast = ToastNotifier(f"Error playing sound: {e}")
@@ -851,7 +976,7 @@ class AudioCue:
         # Create a new thread to play sound asynchronously
         threading.Thread(target=self.play_audio, daemon=True).start()
 
-# noinspection PyUnresolvedReferences
+
 class RentDialog(QDialog):
     def __init__(self, credits_per_minute, wallet, parent=None):
         super().__init__(parent)
@@ -859,8 +984,8 @@ class RentDialog(QDialog):
         self.current_price = 0
         self.wallet = wallet
         self.available_credits = self.wallet.get_total_credits()
-
-        layout = QVBoxLayout()
+        self.setStyleSheet(style_sheet)
+        layout = QHBoxLayout()
 
         self.instruction_label = QLabel("Select the duration in minutes:")
         layout.addWidget(self.instruction_label)
@@ -871,19 +996,30 @@ class RentDialog(QDialog):
         self.time_spinner.setValue(5)
         layout.addWidget(self.time_spinner)
 
-        self.price_label = QLabel(f"Price: {self.current_price}")
-        layout.addWidget(self.price_label)
+        payout = QVBoxLayout()
+        payout.addLayout(layout)
+        line_separator = QFrame()
+        line_separator.setFrameShape(QFrame.Shape.HLine)
+        line_separator.setFrameShadow(QFrame.Shadow.Sunken)
+        line_separator.setLineWidth(5)
+        line_separator.setObjectName("line_separator_vault")
+        payout.addWidget(line_separator)
 
-        self.balance_label = QLabel(f"Available Credits: {self.available_credits}")
-        layout.addWidget(self.balance_label)
+        self.price_label = QLabel(f"Price: {self.current_price}")
+        payout.addWidget(self.price_label)
+
+        self.balance_label = QLabel(f"Balance: {self.available_credits}")
+        payout.addWidget(self.balance_label)
 
         self.time_spinner.valueChanged.connect(self.update_price_and_balance)
 
-        self.confirm_button = QPushButton("Rent")
-        self.confirm_button.clicked.connect(self.accept)
-        layout.addWidget(self.confirm_button)
 
-        self.setLayout(layout)
+        self.confirm_button = QPushButton("Rent")
+        self.confirm_button.setObjectName("confirm_button")
+        self.confirm_button.clicked.connect(self.accept)
+        payout.addWidget(self.confirm_button)
+
+        self.setLayout(payout)
 
         self.update_price_and_balance()
 
@@ -907,7 +1043,7 @@ class RentDialog(QDialog):
         """Return the selected duration and price."""
         return self.time_spinner.value(), self.current_price
 
-# noinspection PyUnresolvedReferences
+
 class VaultWidget(QWidget):
     def __init__(self, app_manager: 'AppManager', wallet: 'Wallet'):
         super().__init__()
@@ -926,7 +1062,6 @@ class VaultWidget(QWidget):
 
         self.list_widget = QListWidget(self)
         main_layout.addWidget(self.list_widget)
-
         hbutton_layout = QHBoxLayout()
         hbuttons = [
             ("Rent Selected", self.rent_selected_app),
@@ -951,7 +1086,7 @@ class VaultWidget(QWidget):
         main_layout.addLayout(vbutton_layout)
         self.setLayout(main_layout)
 
-    def _show_message(self, message,is_mute):
+    def _show_message(self, message, is_mute):
         if not is_mute:
             AudioCue("notification.wav")
         self.toast = ToastNotifier(message)
@@ -1007,7 +1142,7 @@ class VaultWidget(QWidget):
         )
         if file_path and os.path.exists(file_path):
             app_name = os.path.basename(file_path)
-            name = str(app_name).removesuffix('.exe')
+            name = app_name.removesuffix('.exe')
             reply = QMessageBox.question(
                 self,
                 f"Are you sure you want to vault {name}?",
@@ -1023,15 +1158,20 @@ class VaultWidget(QWidget):
                 return
 
     def open_scan_window(self):
-        # Reset scan_window reference if it was closed
-        if self.scan_window is None or not self.scan_window.isVisible():
+        """Open the system app scanner window."""
+
+        if self.scan_window and self.scan_window.isVisible():
+            self.scan_window.activateWindow()
+            return
+        if self.scan_window is not None:
+            self.scan_window = None
+        try:
             file_manager = FileManager()
             self.scan_window = ScanWindow(self, file_manager)
             self.scan_window.show()
-            # Connect the closing signal to reset the reference
             self.scan_window.destroyed.connect(self.on_scan_window_closed)
-        else:
-            self.scan_window.activateWindow()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to create scan window: {str(e)}")
 
     def on_scan_window_closed(self):
         self.scan_window = None
@@ -1051,117 +1191,11 @@ class VaultWidget(QWidget):
         self._show_warning(message)
 
 
-# noinspection PyUnresolvedReferences
 class AppUI(QWidget):
     def __init__(self):
         super().__init__()
 
-        self.setStyleSheet("""
-                    QWidget {
-                        background-color: #202020;
-                        color: #F1EAE3;
-                        font-family: 'Rena';
-                        font-size: 14px;
-                    }
-
-                    QPushButton {
-                        background-color: #5a5a5a;
-                        color: #ffffff;
-                        border: 2px solid #3a3a3a;
-                        padding: 5px 15px;
-                        border-radius: 8px;
-                        font-size: 14px;
-                    }
-
-                    QPushButton:hover {
-                        background-color: #6f6f6f;
-                        border: 2px solid #ffffff;
-                    }
-
-                    QPushButton:pressed {
-                        background-color: #8f8f8f;
-                    }
-
-                    QPushButton:disabled {
-                        background-color: #8f8f8f;
-                    }
-
-                    QCheckBox {
-                        spacing: 8px;
-                    }
-                    QCheckBox:disabled {
-                        color: #7a7a7a; /* Muted color for disabled text */
-                    }
-                    QCheckBox::indicator {
-                        width: 16px;
-                        height: 16px;
-                    }
-
-                    QCheckBox::indicator:unchecked {
-                        border: 1px solid #5a5a5a;
-                        background-color: #3a3a3a;
-                    }
-
-                    QCheckBox::indicator:checked {
-                        border: 1px solid #5a5a5a;
-                        background-color: #ffffff;
-                    }
-
-                    QCheckBox::indicator:disabled {
-                        background-color: #4d4d4d;
-                        border: 1px solid #5a5a5a;
-                    }
-
-                    QSpinBox, QDoubleSpinBox {
-                        background-color: #3a3a3a;
-                        color: #ffffff;
-                        border: 1px solid #5a5a5a;
-                        border-radius: 4px;
-                        padding: 2px;
-                        margin: 4px;
-                    }
-
-                    QSpinBox::up-button, QDoubleSpinBox::up-button {
-                        subcontrol-origin: border;
-                        subcontrol-position: top right;
-                        width: 20px;
-                        border-left: 1px solid #5a5a5a;
-                        image: url('up.png');
-                    }
-
-                    QSpinBox::down-button, QDoubleSpinBox::down-button {
-                        subcontrol-origin: border;
-                        subcontrol-position: bottom right;
-                        width: 20px;
-                        border-left: 1px solid #5a5a5a;
-                        image: url('down.png');
-                    
-                    }
-
-                    QSpinBox::up-arrow, QSpinBox::down-arrow, 
-                    QDoubleSpinBox::up-arrow, QDoubleSpinBox::down-arrow {
-                        width: 10px;
-                        height: 10px;
-                        
-                    }
-
-                    QListWidget {
-                        background-color: #3a3a3a;
-                        color: #ffffff;
-                        border: 1px solid #5a5a5a;
-                    }
-
-                    QMenu {
-                        background-color: #3a3a3a;
-                        color: #ffffff;
-                        border: 1px solid #5a5a5a;
-                    }
-
-                    QMenu::item:selected {
-                        background-color: #5a5a5a;
-                    }
-                """)
-
+        self.setStyleSheet(style_sheet)
         self.tray_icon = QSystemTrayIcon(self)
         self.setWindowTitle("Flow Factory Incorporated")
         self.setWindowIcon(QIcon("FFInc Icon.png"))
@@ -1185,25 +1219,26 @@ class AppUI(QWidget):
         self.timer_app.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.vault_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-        line_separator = QFrame()
-        line_separator.setFrameShape(QFrame.Shape.HLine)  # Horizontal line
-        line_separator.setFrameShadow(QFrame.Shadow.Sunken)
-        line_separator.setLineWidth(5)# Optional: make it look sunken
-
         # Now add the separator to the layout between the timer_app and button_toggle_vault
         main_layout = QVBoxLayout()
         main_layout.addWidget(self.timer_app)
-        main_layout.addWidget(line_separator)  # Add the line here
         main_layout.addWidget(button_toggle_vault)
         main_layout.addWidget(self.vault_widget)
         main_layout.setContentsMargins(20, 20, 20, 20)
         self.setLayout(main_layout)
-
+        shadow = QGraphicsDropShadowEffect()
+        shadow.setBlurRadius(40)
+        shadow.setXOffset(0)
+        shadow.setYOffset(0)
+        shadow.setColor(QColor(0, 0, 0, 50))
+        button_toggle_vault.setGraphicsEffect(shadow)
         self.setLayout(main_layout)
         self.init_tray_icon()
+
     def adjust_size(self):
         self.layout().invalidate()
         self.adjustSize()
+
     def toggle_vault_visibility(self):
         """Toggle the visibility of the vault widget and adjust window size."""
         if self.vault_widget.isVisible():
@@ -1255,16 +1290,250 @@ class AppUI(QWidget):
             event.ignore()
             self.hide()
 
+
+style_sheet = """
+                QWidget {
+                    background-color: qlineargradient(
+                        x1: 0, y1: 0, x2: 1, y2: 1,
+                        stop: 0 #2E3440,
+                        stop: 1 #3B4252
+                    );
+                    border-radius: 15px;
+                    color: #ECEFF4;
+                    font-family: "Feature Mono";
+                    font-size: 12pt;
+                }
+    
+                QFrame {
+                    background: transparent;
+                    border: none;
+                    
+                }
+    
+                QPushButton {
+                    background-color: qlineargradient(
+                        x1: 0, y1: 0, x2: 1, y2: 1,
+                        stop: 0 #4C566A,
+                        stop: 1 #434C5E
+                    );
+                    border: 2px solid #4C566A;
+                    border-radius: 10px;
+                    color: #ECEFF4;
+                    padding: 5px;
+                    font-size: 11pt;
+                    font-weight: bold;
+                    text-align: center;
+                    margin:2px;
+                }
+                QPushButton#confirm_button {
+                    background-color: qlineargradient(
+                        x1: 0, y1: 0, x2: 1, y2: 1,
+                        stop: 0 #4C566A,
+                        stop: 1 #434C5E
+                    );
+                    border: 2px solid #4C566A;
+                    border-radius: 10px;
+                    color: #ECEFF4;
+                    padding: 5px;
+                    font-size: 11pt;
+                    font-weight: bold;
+                    text-align: center;
+                    margin:5px;
+                }
+    
+                QPushButton:hover {
+                    background-color: qlineargradient(
+                        x1: 0, y1: 0, x2: 1, y2: 1,
+                        stop: 0 #5E81AC,
+                        stop: 1 #4C566A
+                    );
+                }
+    
+                QPushButton:pressed {
+                    background-color: qlineargradient(
+                        x1: 0, y1: 0, x2: 1, y2: 1,
+                        stop: 0 #81A1C1,
+                        stop: 1 #5E81AC
+                    );
+                }
+    
+                QPushButton:disabled {
+                    background-color: #4C566A;
+                    color: #81A1C1;
+                }
+                QCheckBox {
+                    background-color: transparent;
+                }
+                QCheckBox:disabled {
+                    color: #4C566A;
+                    check-color: #4C566A;
+                }
+    
+                QLineEdit, QTextEdit {
+                    background-color: rgba(255, 255, 255, 0.1);
+                    border: 1px solid #4C566A;
+                    border-radius: 8px;
+                    color: #ECEFF4;
+                    padding: 5px;
+                    font-size: 10pt;
+                }
+    
+                QLineEdit:hover, QTextEdit:hover {
+                    background-color: rgba(255, 255, 255, 0.15);
+                }
+    
+                QLineEdit:focus, QTextEdit:focus {
+                    border: 2px solid #5E81AC;
+                }
+    
+                QFrame#line_separator_app {
+                    background-color: #4C566A;
+                }
+                
+                QFrame#line_separator_vault {
+                    background-color: #4C566A;
+                    padding: 10px;
+                }
+    
+                QMenu {
+                    background-color: #2E3440;
+                    color: #ECEFF4;
+                    border: 1px solid #4C566A;
+                }
+    
+                QMenu::item {
+                    padding: 5px 20px;
+                }
+    
+                QMenu::item:selected {
+                    background-color: #4C566A;
+                }
+    
+                QSystemTrayIcon {
+                    icon-size: 24px;
+                }
+    
+                /* Shadows and Transparency */
+                QFrame, QPushButton {
+                    box-shadow: 0px 4px 10px rgba(0, 0, 0, 0.2);
+                }
+    
+                /* Scrollbars */
+                QScrollBar {
+                    border: none;
+                    background-color: transparent;
+                    border-radius: 5px;
+                    width: 10px;
+                    position: absolute;
+                }
+                
+                QScrollBar::handle:vertical {
+                    background-color: #5E81AC; /* Default handle color */
+                    min-height: 20px;
+                    border-radius: 5px;
+                }
+                
+                /* Adjust handle appearance when hovered or pressed */
+                QScrollBar::handle:vertical:hover {
+                    background-color: #4C6B88; /* Change color on hover */
+                }
+                
+                QScrollBar::handle:vertical:pressed {
+                    background-color: #3B5B7A; /* Change color when pressed */
+                }
+                
+                QScrollBar::add-line:vertical,
+                QScrollBar::sub-line:vertical {
+                    height: 0; /* Hide arrows */
+                }
+                
+                /* Hide selection indicator by removing background or outline */
+                QScrollBar::handle:vertical:selected {
+                    background-color: #5E81AC; /* Keep the handle color consistent */
+                }
+    
+                /* Tooltips */
+                QToolTip {
+                    background-color: #4C566A;
+                    color: #ECEFF4;
+                    border: 1px solid #81A1C1;
+                    padding: 5px;
+                    border-radius: 5px;
+                }
+                QSpinBox {
+                    background-color: transparent;
+                    border: 2px solid #4C566A;
+                    border-radius: 8px;
+                    color: #ECEFF4;
+                    padding: 5px;
+                    font-size: 11pt;
+                }
+    
+                QSpinBox::up-button {
+                    background-color: #4C566A;
+                    border: none;
+                    subcontrol-origin: border;
+                    subcontrol-position: top right;
+                    width: 10px;
+                    height: 10px;
+                    border-radius: 5px; /* Circular button */
+                    margin-right: 6px; /* Moves the button away from the right edge */
+                    margin-top: 6px; /* Moves the button down slightly from the top edge */
+                }
+    
+                QSpinBox::down-button {
+                    background-color: #4C566A;
+                    border: none;
+                    subcontrol-origin: border;
+                    subcontrol-position: bottom right;
+                    width: 10px;
+                    height: 10px;
+                    border-radius: 5px; /* Circular button */
+                    margin-right: 6px; /* Moves the button away from the right edge */
+                    margin-bottom: 6px; /* Moves the button down slightly from the top edge */
+                }
+    
+                QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+                    background-color: #ECEFF4; /* Slightly off-white on hover */
+                }
+    
+                QSpinBox::up-button:pressed, QSpinBox::down-button:pressed {
+                    background-color: #D8DEE9; /* Even lighter shade on press */
+                }
+                QListWidget {
+                    background-color: transparent;
+                    border: 2px solid #4C566A;
+                    color: #ECEFF4;
+                    margin: 5px;
+                    padding-right: 5px;
+                    padding-left: 6px;
+                    padding-bottom: 5px;
+                    padding-top: 5px;
+                }
+                QListWidget::item {
+                    margin: 3px;
+                }
+                QListWidget::item:selected {
+                    background-color: #5E81AC;
+                    border-radius: 10px;
+                    selection-color: #ECEFF4;
+                    elevation: 5;    
+                }
+                QListWidget::item:selected:!active {
+                    background-color: #5E81AC;
+                    border-radius: 10px;
+                    selection-color: #ECEFF4;
+                    elevation: 5;
+                }
+                QListWidget::item:hover {
+                    background-color: #4C566A;
+                    border-radius: 10px;
+                }
+                """
+
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    # NOTE : subject to change / removal
-    font_id = QFontDatabase.addApplicationFont("Rena-Regular.ttf")
-    if font_id != -1:
-        font_families = QFontDatabase.applicationFontFamilies(font_id)
-        if font_families:
-            font = QFont(font_families[0], 12)
-            app.setFont(font)
     window = AppUI()
     window.show()
     sys.exit(app.exec())
-
